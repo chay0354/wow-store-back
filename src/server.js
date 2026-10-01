@@ -3,7 +3,7 @@ import cors from 'cors';
 import path from 'node:path';
 import fs from 'node:fs';
 import { config } from './config.js';
-import { db } from './db.js';
+import { pingDb } from './db.js';
 import publicRoutes from './routes/public.js';
 import adminRoutes from './routes/admin.js';
 import affiliateRoutes from './routes/affiliate.js';
@@ -30,5 +30,14 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'שגיאת שרת' });
 });
 
-db.get();
-app.listen(config.port, () => console.log(`API ready on http://localhost:${config.port}`));
+export default app;
+
+// Vercel imports this file and serves the exported app. Listen only when running locally.
+if (!process.env.VERCEL) {
+  if (!process.env.SUPABASE_SECRET_KEY) {
+    console.error('[config] SUPABASE_SECRET_KEY is missing from .env. Paste the full secret from the Supabase API keys page.');
+    process.exit(1);
+  }
+  await pingDb();
+  app.listen(config.port, () => console.log(`API ready on http://localhost:${config.port}`));
+}

@@ -1,11 +1,12 @@
 // Admin panel API. Login with ADMIN_PASSWORD, then send `Authorization: Bearer <token>`.
 import { Router } from 'express';
-import { db } from '../db.js';
+import { deleteCoupon, insertCoupon, loadAll, payCoupon, updateCoupon, updateOrderStatus } from '../db.js';
 import { config } from '../config.js';
 import { signToken, requireRole } from '../middleware/auth.js';
 import { hashPassword, safeEqual } from '../lib/password.js';
 import { normCode, clean } from '../lib/validate.js';
 import { loginLimiter } from '../middleware/limit.js';
+import { asyncRoute } from '../lib/async.js';
 
 const r = Router();
 const ORDER_STATUSES = ['new', 'processing', 'shipped', 'cancelled'];
@@ -21,7 +22,7 @@ r.use(requireRole('admin'));
 
 function couponStats(code, earnings) {
   const rows = earnings.filter((e) => e.code === code && e.status !== 'cancelled');
-  const sum = (arr, k) => Math.round(arr.reduce((s, e) => s + e[k], 0) * 100) / 100;
+  const sum = (arr, key) => Math.round(arr.reduce((s, e) => s + e[key], 0) * 100) / 100;
   return {
     orders: rows.length,
     sales: sum(rows, 'sale'),
@@ -29,13 +30,14 @@ function couponStats(code, earnings) {
     unpaid: sum(rows.filter((e) => e.status === 'pending'), 'commission'),
   };
 }
-const publicCoupon = (c, earnings) => {
-  const { pinHash, ...rest } = c;
-  return { ...rest, hasPin: !!pinHash, stats: couponStats(c.code, earnings) };
+
+const publicCoupon = (coupon, earnings) => {
+  const { pinHash, ...rest } = coupon;
+  return { ...rest, hasPin: !!pinHash, stats: couponStats(coupon.code, earnings) };
 };
 
-r.get('/summary', (req, res) => {
-  const { orders, earnings, coupons } = db.get();
+r.get('/summary', asyncRoute(async (req, res) => {
+  const { orders, earnings, coupons } = await loadAll();
   const live = orders.filter((o) => o.status !== 'cancelled');
   res.json({
     revenue: Math.round(live.reduce((s, o) => s + o.total, 0) * 100) / 100,
@@ -44,35 +46,29 @@ r.get('/summary', (req, res) => {
     commissionDue: Math.round(earnings.filter((e) => e.status === 'pending').reduce((s, e) => s + e.commission, 0) * 100) / 100,
     activeCoupons: coupons.filter((c) => c.active).length,
   });
-});
+}));
 
-r.get('/orders', (req, res) => {
-  const orders = [...db.get().orders].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+r.get('/orders', asyncRoute(async (req, res) => {
+  const { orders } = await loadAll();
   res.json({ orders });
-});
+}));
 
-r.patch('/orders/:id', async (req, res) => {
-  const data = db.get();
-  const order = data.orders.find((o) => o.id === req.params.id);
-  if (!order) return res.status(404).json({ error: 'הזמנה לא נמצאה' });
+r.patch('/orders/:id', asyncRoute(async (req, res) => {
   const { status } = req.body || {};
   if (!ORDER_STATUSES.includes(status)) return res.status(400).json({ error: 'סטטוס לא תקין' });
-  order.status = status;
-  const earning = data.earnings.find((e) => e.orderId === order.id);
-  if (earning && earning.status !== 'paid') earning.status = status === 'cancelled' ? 'cancelled' : 'pending';
-  await db.save();
+  const order = await updateOrderStatus(req.params.id, status);
+  if (!order) return res.status(404).json({ error: 'הזמנה לא נמצאה' });
   res.json({ order });
-});
+}));
 
-r.get('/coupons', (req, res) => {
-  const { coupons, earnings } = db.get();
+r.get('/coupons', asyncRoute(async (req, res) => {
+  const { coupons, earnings } = await loadAll();
   res.json({ coupons: coupons.map((c) => publicCoupon(c, earnings)) });
-});
+}));
 
 const pct = (v) => Number.isFinite(+v) && +v >= 0 && +v <= 50;
 
-r.post('/coupons', async (req, res) => {
-  const data = db.get();
+r.post('/coupons', asyncRoute(async (req, res) => {
   const code = normCode(req.body?.code);
   const name = clean(req.body?.name, 80);
   const { discount, commission, pin } = req.body || {};
@@ -80,45 +76,50 @@ r.post('/coupons', async (req, res) => {
   if (!name) return res.status(400).json({ error: 'הוסיפו את שם השותף' });
   if (!pct(discount) || !pct(commission)) return res.status(400).json({ error: 'אחוזים בין 0 ל-50' });
   if (!pin || String(pin).length < 4) return res.status(400).json({ error: 'קוד כניסה לשותף: לפחות 4 תווים' });
-  if (data.coupons.some((c) => c.code === code)) return res.status(409).json({ error: `הקוד ${code} כבר קיים` });
   const coupon = { code, name, discount: +discount, commission: +commission, active: true, pinHash: hashPassword(pin), createdAt: new Date().toISOString() };
-  data.coupons.push(coupon);
-  await db.save();
-  res.status(201).json({ coupon: publicCoupon(coupon, data.earnings) });
-});
+  try {
+    const saved = await insertCoupon(coupon);
+    const { earnings } = await loadAll();
+    res.status(201).json({ coupon: publicCoupon(saved, earnings) });
+  } catch (err) {
+    if (err.status === 409) return res.status(409).json({ error: `הקוד ${code} כבר קיים` });
+    throw err;
+  }
+}));
 
-r.patch('/coupons/:code', async (req, res) => {
-  const data = db.get();
-  const c = data.coupons.find((x) => x.code === normCode(req.params.code));
-  if (!c) return res.status(404).json({ error: 'קופון לא נמצא' });
-  const b = req.body || {};
-  if (b.name !== undefined) c.name = clean(b.name, 80);
-  if (b.active !== undefined) c.active = !!b.active;
-  if (b.discount !== undefined) { if (!pct(b.discount)) return res.status(400).json({ error: 'אחוזים בין 0 ל-50' }); c.discount = +b.discount; }
-  if (b.commission !== undefined) { if (!pct(b.commission)) return res.status(400).json({ error: 'אחוזים בין 0 ל-50' }); c.commission = +b.commission; }
-  if (b.pin) { if (String(b.pin).length < 4) return res.status(400).json({ error: 'קוד כניסה: לפחות 4 תווים' }); c.pinHash = hashPassword(b.pin); }
-  await db.save();
-  res.json({ coupon: publicCoupon(c, data.earnings) });
-});
-
-r.delete('/coupons/:code', async (req, res) => {
-  const data = db.get();
+r.patch('/coupons/:code', asyncRoute(async (req, res) => {
   const code = normCode(req.params.code);
-  const before = data.coupons.length;
-  data.coupons = data.coupons.filter((c) => c.code !== code);
-  if (data.coupons.length === before) return res.status(404).json({ error: 'קופון לא נמצא' });
-  await db.save(); // earnings history is kept on purpose
+  const body = req.body || {};
+  const patch = {};
+  if (body.name !== undefined) patch.name = clean(body.name, 80);
+  if (body.active !== undefined) patch.active = !!body.active;
+  if (body.discount !== undefined) {
+    if (!pct(body.discount)) return res.status(400).json({ error: 'אחוזים בין 0 ל-50' });
+    patch.discount = +body.discount;
+  }
+  if (body.commission !== undefined) {
+    if (!pct(body.commission)) return res.status(400).json({ error: 'אחוזים בין 0 ל-50' });
+    patch.commission = +body.commission;
+  }
+  if (body.pin) {
+    if (String(body.pin).length < 4) return res.status(400).json({ error: 'קוד כניסה: לפחות 4 תווים' });
+    patch.pinHash = hashPassword(body.pin);
+  }
+  const saved = await updateCoupon(code, patch);
+  if (!saved) return res.status(404).json({ error: 'קופון לא נמצא' });
+  const { earnings } = await loadAll();
+  res.json({ coupon: publicCoupon(saved, earnings) });
+}));
+
+r.delete('/coupons/:code', asyncRoute(async (req, res) => {
+  const removed = await deleteCoupon(normCode(req.params.code));
+  if (!removed) return res.status(404).json({ error: 'קופון לא נמצא' });
   res.json({ ok: true });
-});
+}));
 
-r.post('/coupons/:code/pay', async (req, res) => {
-  const data = db.get();
-  const code = normCode(req.params.code);
-  const now = new Date().toISOString();
-  let count = 0;
-  for (const e of data.earnings) if (e.code === code && e.status === 'pending') { e.status = 'paid'; e.paidAt = now; count++; }
-  await db.save();
-  res.json({ paid: count });
-});
+r.post('/coupons/:code/pay', asyncRoute(async (req, res) => {
+  const paid = await payCoupon(normCode(req.params.code));
+  res.json({ paid });
+}));
 
 export default r;
