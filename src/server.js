@@ -8,9 +8,21 @@ import publicRoutes from './routes/public.js';
 import adminRoutes from './routes/admin.js';
 import affiliateRoutes from './routes/affiliate.js';
 
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+  if (config.clientOrigin.includes(origin)) return true;
+  try {
+    const { hostname } = new URL(origin);
+    if (hostname === 'localhost' || hostname === '127.0.0.1') return true;
+    return hostname === 'wow-store-front.vercel.app' || (hostname.endsWith('.vercel.app') && hostname.startsWith('wow-store-front'));
+  } catch {
+    return false;
+  }
+}
+
 const app = express();
 app.set('trust proxy', 1);
-app.use(cors({ origin: config.clientOrigin }));
+app.use(cors({ origin: (origin, callback) => callback(null, isAllowedOrigin(origin)) }));
 app.use(express.json({ limit: '100kb' }));
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));

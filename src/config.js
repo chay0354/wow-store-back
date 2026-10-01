@@ -1,9 +1,16 @@
 import 'dotenv/config';
 
-const clientOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173')
+const configuredOrigins = (process.env.CLIENT_ORIGIN || '')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
+
+const clientOrigins = [...new Set([
+  ...configuredOrigins,
+  'http://localhost:5173',
+  'http://localhost:5181',
+  'https://wow-store-front.vercel.app',
+])];
 
 export const config = {
   port: Number(process.env.PORT || 4000),
